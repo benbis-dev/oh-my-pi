@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
 	type Context,
@@ -1645,6 +1645,295 @@ describe("AgentSession auto-prewalk", () => {
 
 			expect(f.requested.at(-1)).toBe(f.target.id);
 			expect(f.notices.at(-1)).toBe("Auto-prewalk: primary (prewalk 0.10)");
+		});
+	});
+
+	describe("actual implementation handoff supersession", () => {
+		it.each(["metadata", "reconciliation", "prompt construction"] as const)(
+			"keeps an explicit Medium pick and manual Opus arm across target %s",
+			async phase => {
+				const calls = stubJudge([PREWALK, DIRECT]);
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let held = false;
+				const f = createFixture([...cycle(), done("independent explanation")], {
+					auto: "on",
+					rebuildSystemPrompt: async names => {
+						const systemPrompt = [`model:${session?.model?.id}`, `tools:${names.join(",")}`];
+						if (phase === "prompt construction" && !held && session?.model?.id === f.target.id) {
+							held = true;
+							entered.resolve();
+							await release.promise;
+						}
+						return { systemPrompt };
+					},
+					beforeStream: async context => {
+						const policy = context.systemPrompt?.join("\n") ?? "";
+						expect(policy).toContain(`model:${f.session.model?.id}`);
+						expect(policy).toContain(`tools:${context.tools?.map(tool => tool.name).join(",")}`);
+					},
+				});
+				await f.session.refreshBaseSystemPrompt();
+				if (phase === "metadata") {
+					const refresh = f.modelRegistry.refreshSelectedModelMetadata.bind(f.modelRegistry);
+					vi.spyOn(f.modelRegistry, "refreshSelectedModelMetadata").mockImplementation(async model => {
+						// Automatic resolution also refreshes this row, before any implementation action.
+						if (!held && model.id === f.target.id && f.requested.length === 2) {
+							held = true;
+							entered.resolve();
+							await release.promise;
+						}
+						return refresh(model);
+					});
+				} else if (phase === "reconciliation") {
+					const reconcile = SessionTools.prototype.reconcileThinkTool;
+					vi.spyOn(SessionTools.prototype, "reconcileThinkTool").mockImplementation(async function (
+						this: SessionTools,
+						...args
+					) {
+						if (!held && f.session.model?.id === f.target.id) {
+							held = true;
+							entered.resolve();
+							await release.promise;
+						}
+						return reconcile.apply(this, args);
+					});
+				}
+				const publications: string[] = [];
+				f.session.subscribe(event => {
+					if (event.type === "model_changed") publications.push(`model:${f.session.model?.id}`);
+					if (event.type === "thinking_level_changed") publications.push(`effort:${event.thinkingLevel}`);
+				});
+				const task = f.session.prompt(TASK);
+				let manualArm: Prewalk | undefined;
+				let pickedAt = 0;
+				try {
+					await Promise.race([
+						entered.promise,
+						task.then(() => {
+							throw new Error(
+								`Task ended before target ${phase}: requests=${f.requested.join(",")}; last=${JSON.stringify(f.session.agent.state.messages.at(-1))}`,
+							);
+						}),
+					]);
+					expect(f.requested).toEqual([f.primary.id, f.primary.id]);
+					expect(f.efforts).toEqual([Effort.High, Effort.High]);
+					expect(f.session.model?.id).toBe(phase === "metadata" ? f.primary.id : f.target.id);
+					expect(f.session.configuredThinkingLevel()).toBe(phase === "metadata" ? Effort.High : Effort.Low);
+					if (phase !== "metadata") {
+						expect(publications).toContain(`model:${f.target.id}`);
+						expect(publications).toContain(`effort:${Effort.Low}`);
+					}
+					f.session.setThinkingLevel(Effort.Medium);
+					expect(f.session.armPrewalk(f.planner, Effort.Max)).toBe(true);
+					manualArm = f.session.getPrewalkState();
+					expect(manualArm?.target).toBe(f.planner);
+					pickedAt = publications.length;
+				} finally {
+					release.resolve();
+				}
+				await task;
+				const selected = phase === "metadata" ? f.primary : f.target;
+				expect(f.session.getPrewalkState()).toBe(manualArm);
+				expect(f.session.model?.id).toBe(selected.id);
+				expect(f.session.configuredThinkingLevel()).toBe(Effort.Medium);
+				expect(publications.slice(pickedAt)).toEqual([]);
+				expect(f.nudges.flat()).not.toContain("prewalk-checklist");
+				expect(f.notices.some(message => message.startsWith("Prewalk: switched"))).toBe(false);
+				expect(f.requested[2]).toBe(selected.id);
+				expect(f.efforts[2]).toBe(Effort.Medium);
+				const nextTaskBoundary = f.requested.length;
+
+				await f.session.prompt("explain the cursor without changing any files");
+
+				expect(f.requested[nextTaskBoundary]).toBe(selected.id);
+				expect(f.efforts[nextTaskBoundary]).toBe(Effort.Medium);
+				for (let index = 2; index < f.requested.length; index++) {
+					expect(f.requested[index]).toBe(selected.id);
+					expect(f.efforts[index]).toBe(Effort.Medium);
+				}
+				expect(f.session.getPrewalkState()).toBe(manualArm);
+				expect(f.session.configuredThinkingLevel()).toBe(Effort.Medium);
+				expect(publications.slice(pickedAt)).toEqual([]);
+				expect(f.nudges.flat()).not.toContain("prewalk-checklist");
+				expect(asked(calls)[0]).toMatchObject({ model: f.primary.id, configured: Effort.High });
+			},
+		);
+
+		it("preserves replacement guidance when a write turn-end supersedes the genuine persistence wait", async () => {
+			stubJudge([PREWALK, DIRECT]);
+			const f = createFixture([...cycle(), done("independent explanation")], { auto: "on" });
+			const publications: string[] = [];
+			let picked = false;
+			let armed = false;
+			let pickedAt = 0;
+			let requestBoundary = 0;
+			let manualArm: Prewalk | undefined;
+			let originalGuidance: AgentMessage | undefined;
+			let replacementGuidance: AgentMessage | undefined;
+			let oldGuidanceRemoved = false;
+			f.session.subscribe(event => {
+				if (event.type === "model_changed") publications.push(`model:${f.session.model?.id}`);
+				if (event.type === "thinking_level_changed") publications.push(`effort:${event.thinkingLevel}`);
+				if (
+					picked ||
+					event.type !== "turn_end" ||
+					!event.toolResults.some(result => result.toolName === "write" && !result.isError)
+				) {
+					return;
+				}
+				picked = true;
+				requestBoundary = f.requested.length;
+				originalGuidance = [...f.session.agent.state.messages, ...f.session.agent.peekSteeringQueue()].find(
+					message => message.role === "custom" && message.customType === "prewalk-plan",
+				);
+				f.session.setThinkingLevel(Effort.Medium);
+				oldGuidanceRemoved = ![...f.session.agent.state.messages, ...f.session.agent.peekSteeringQueue()].some(
+					message => message.role === "custom" && message.customType === "prewalk-plan",
+				);
+				armed = f.session.armPrewalk(f.planner, Effort.Max);
+				manualArm = f.session.getPrewalkState();
+				replacementGuidance = f.session.agent
+					.peekSteeringQueue()
+					.find(message => message.role === "custom" && message.customType === "prewalk-plan");
+				pickedAt = publications.length;
+			});
+
+			await f.session.prompt(TASK);
+
+			expect(picked).toBe(true);
+			expect(armed).toBe(true);
+			expect(requestBoundary).toBe(2);
+			expect(f.requested.slice(0, requestBoundary)).toEqual([f.primary.id, f.primary.id]);
+			expect(f.efforts.slice(0, requestBoundary)).toEqual([Effort.High, Effort.High]);
+			expect(oldGuidanceRemoved).toBe(true);
+			expect(replacementGuidance).toBeDefined();
+			expect(replacementGuidance).not.toBe(originalGuidance);
+			expect(manualArm?.target).toBe(f.planner);
+			expect(f.session.getPrewalkState()).toBe(manualArm);
+			expect(f.session.model?.id).toBe(f.primary.id);
+			expect(f.session.configuredThinkingLevel()).toBe(Effort.Medium);
+			expect(publications.slice(pickedAt)).toEqual([]);
+			// The old plan was withdrawn before arming; this provider-visible plan is the replacement's.
+			expect(f.nudges[requestBoundary]).toContain("prewalk-plan");
+			expect(f.nudges.flat()).not.toContain("prewalk-checklist");
+			expect(f.notices.some(message => message.startsWith("Prewalk: switched"))).toBe(false);
+			const nextTaskBoundary = f.requested.length;
+
+			await f.session.prompt("explain the cursor without changing any files");
+
+			expect(f.requested[nextTaskBoundary]).toBe(f.primary.id);
+			expect(f.efforts[nextTaskBoundary]).toBe(Effort.Medium);
+			for (let index = requestBoundary; index < f.requested.length; index++) {
+				expect(f.requested[index]).toBe(f.primary.id);
+				expect(f.efforts[index]).toBe(Effort.Medium);
+			}
+			expect(f.session.getPrewalkState()).toBe(manualArm);
+			expect(f.session.configuredThinkingLevel()).toBe(Effort.Medium);
+			expect(publications.slice(pickedAt)).toEqual([]);
+			expect(f.nudges.flat()).not.toContain("prewalk-checklist");
+		});
+
+		it.each([
+			["assistant", "same-target takeover"],
+			["tool result", "same-target takeover"],
+			["assistant", "replacement arm"],
+			["tool result", "replacement arm"],
+		] as const)("retires a handoff during %s persistence after %s", async (boundary, takeover) => {
+			stubJudge([DIRECT]);
+			const f = createFixture([done("source message")], { auto: "off" });
+			await f.session.prompt("explain the cursor");
+			const message = f.session.agent.state.messages.find(message => message.role === "assistant");
+			if (!message) throw new Error("Expected an assistant message");
+			const toolResult = {
+				role: "toolResult" as const,
+				toolCallId: "write",
+				toolName: "write",
+				content: [{ type: "text" as const, text: "wrote" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const selected: string[] = [];
+			let active = f.primary;
+			let configured: ConfiguredThinkingLevel | undefined = Effort.High;
+			const host: PrewalkCoordinatorHost = {
+				agent: f.session.agent,
+				sessionManager: f.session.sessionManager,
+				settings: Settings.isolated({ "prewalk.auto": "on" }),
+				model: () => active,
+				configuredThinkingLevel: () => configured,
+				resolveDefaultPrewalk: () => undefined,
+				resolveAutoPrewalkTarget: () => ({ target: f.target, thinkingLevel: Effort.Low }),
+				resolveAutoPrewalkPlanningModel: () => undefined,
+				prepareAutoPrewalkModel: async model => model,
+				classifyAutoPrewalk: async () => undefined,
+				emitNotice: () => {},
+				setModelTemporary: async (model, thinkingLevel, options) => {
+					if (options?.commitIf && !options.commitIf()) return;
+					active = model;
+					configured = thinkingLevel;
+					selected.push(model.id);
+					options?.onSelected?.();
+				},
+				setActiveToolsByName: async () => {},
+				restoreNonMCPToolPresentation: async () => {},
+				getActiveToolNames: () => ["write"],
+				getEnabledToolNames: () => ["write"],
+				getMountedXdevToolNames: () => [],
+				hasBuiltInTool: () => false,
+				getPlanModeState: () => undefined,
+				setPlanModeState: () => {},
+				getPlanReferencePath: () => "",
+				setPlanProposalHandler: () => {},
+				waitForSessionMessagePersistence: async pending => {
+					if (pending !== (boundary === "assistant" ? message : toolResult)) return;
+					entered.resolve();
+					await release.promise;
+				},
+				localProtocolOptions: () => ({}),
+			};
+			const coordinator = new PrewalkCoordinator(host, {});
+			const nudge = coordinator.applyAuto({
+				route: "prewalk",
+				probabilities: PREWALK.probabilities,
+				confidence: PREWALK.confidence,
+				arm: true,
+			});
+			if (!nudge) throw new Error("Expected an automatic arm");
+			host.agent.steer(nudge);
+			const originalArm = coordinator.state;
+			const handoff = coordinator.advanceAtTurnEnd(host.agent.state.messages, {
+				message,
+				toolResults: [toolResult],
+				willContinue: true,
+			});
+			let manualArm: Prewalk | undefined;
+			let guidance: readonly AgentMessage[] = [];
+			try {
+				await entered.promise;
+				if (takeover === "replacement arm") {
+					coordinator.disarm();
+					expect(coordinator.arm(f.planner, Effort.Max)).toBe(true);
+				} else {
+					expect(coordinator.arm(f.target, Effort.Low)).toBe(true);
+					expect(coordinator.state).toBe(originalArm);
+				}
+				manualArm = coordinator.state;
+				guidance = host.agent.peekSteeringQueue();
+				expect(guidance.some(item => item.role === "custom" && item.customType === "prewalk-plan")).toBe(true);
+			} finally {
+				release.resolve();
+			}
+			await handoff;
+			expect(selected).toEqual([]);
+			expect(coordinator.state).toBe(manualArm);
+			expect(host.agent.peekSteeringQueue()).toEqual(guidance);
+			await coordinator.beginAutoTask();
+			expect(selected).toEqual([]);
+			expect(coordinator.state).toBe(manualArm);
+			expect(host.agent.peekSteeringQueue()).toEqual(guidance);
 		});
 	});
 

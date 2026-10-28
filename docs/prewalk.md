@@ -139,6 +139,8 @@ Automatic routing belongs to one task. Before the next independent task is judge
 
 An explicit model or thinking-level selection during or after automatic routing takes ownership: the session stays where you put it. Handoffs made by `/prewalk`, `--prewalk`, or `prewalk.enabled` are never restored by auto-prewalk. If you pick another model while a selected planner prepares a task, the planner's policy is never sent to your model: a typed or `/skill:` prompt is dropped with a warning (typed text returns to the editor), and sending the same prompt again runs it on your pick without automatic routing; a queued follow-up is prepared again for your pick and continues there. Context promotion is not a selection: a task promoted during its own preparation dispatches on the promoted model, as it does without a planner, and the next task still restores the baseline from a promoted planner or handoff model.
 
+Accepted manual arms retain their planning guidance even if an older automatic handoff finishes waiting for persistence or model setup.
+
 ### What is classified
 
 Only new, user-authored tasks in the top-level session: typed prompts, user-invoked `/skill:` prompts, and queued follow-ups when they are delivered. Steering is never classified, since it amends the task already running. Acknowledgements such as `ok` or `thanks`, synthetic continuation turns, agent-attributed messages, subagents, plan mode, and tasks where prewalk is already armed are skipped.

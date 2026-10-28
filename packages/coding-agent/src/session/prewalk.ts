@@ -517,9 +517,14 @@ export class PrewalkCoordinator {
 			return;
 		}
 
+		// A matching manual arm can reuse this object while invalidating the in-flight handoff.
+		const generation = this.#selectionGeneration;
+		const current = () => generation === this.#selectionGeneration && this.#prewalk === prewalk;
 		await this.#host.waitForSessionMessagePersistence(context.message);
+		if (!current()) return;
 		for (const toolResult of context.toolResults) {
 			await this.#host.waitForSessionMessagePersistence(toolResult);
+			if (!current()) return;
 		}
 		this.#scrubPlanNudge(liveMessages);
 		const target = prewalk.target;
@@ -531,8 +536,6 @@ export class PrewalkCoordinator {
 		const sourceThinkingLevel = this.#host.configuredThinkingLevel();
 		const auto = this.#autoArm === prewalk;
 		const baseline = auto && this.#handoff?.auto ? this.#handoff : undefined;
-		const generation = this.#selectionGeneration;
-		const current = () => generation === this.#selectionGeneration && this.#prewalk === prewalk;
 		await this.#host.setModelTemporary(target, prewalk.thinkingLevel, {
 			ephemeral: true,
 			commitIf: current,
