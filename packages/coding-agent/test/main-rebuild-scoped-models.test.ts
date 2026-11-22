@@ -2,10 +2,11 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-import { cfgModelProviderOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { formatModelStringWithRouting, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgEnabledModels, cfgModelProviderOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildSessionOptions,
@@ -91,6 +92,31 @@ async function startupScope(
 }
 
 describe("watchScopedModelSettings", () => {
+	it("replaces the scope when an enabled model changes only its upstream pin", async () => {
+		const source = "openrouter/z-ai/glm-4.7@sambanova";
+		const target = "openrouter/z-ai/glm-4.7@cerebras";
+		const settings = Settings.isolated();
+		cfgEnabledModels.set(settings, [source]);
+		const bundled = getBundledModel("openrouter", "z-ai/glm-4.7");
+		if (!bundled) throw new Error("Expected bundled OpenRouter model");
+		const registry = new FakeRegistry([bundled]);
+		const session = new FakeSession(await startupScope([source], registry, settings));
+		expect(session.scopedModels.map(entry => formatModelStringWithRouting(entry.model))).toEqual([source]);
+
+		watchScopedModelSettings(session, parseArgs([]), registry, settings);
+		try {
+			cfgEnabledModels.set(settings, [target]);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+
+			expect(session.setCalls).toBe(1);
+			expect(session.scopedModels.map(entry => formatModelStringWithRouting(entry.model))).toEqual([target]);
+		} finally {
+			for (const dispose of session.disposers) dispose();
+		}
+	});
+
 	it("updates the cycling scope when provider preference changes an enabled model", async () => {
 		const id = "anthropic/claude-preset-fixture";
 		const patterns = [id];
@@ -293,6 +319,22 @@ describe("buildSessionOptions --models scope selection", () => {
 		expect(options.model).toBeUndefined();
 		expect(options.modelPattern).toEqual(["extprov/model-x", "extprov/model-y"]);
 		expect(options.scopedModels).toBeUndefined();
+	});
+
+	it("starts on the remembered free variant and its pin when --models also allows the paid model", async () => {
+		const paid = "openrouter/qwen/qwen3-coder";
+		const saved = `${paid}:free@cerebras`;
+		const parsed = parseArgs(["--models", `${paid},${paid}:free`]);
+		const settings = Settings.isolated({ modelRoles: { default: saved } });
+		const modelRegistry = registry();
+		authStorage.keys.setRuntime("openrouter", "test-key");
+		try {
+			const scoped = await resolveScopedModels(parsed, modelRegistry, settings);
+			const options = await buildSessionOptions(parsed, scoped, SessionManager.inMemory(), modelRegistry, settings);
+			expect(options.model && formatModelStringWithRouting(options.model)).toBe(saved);
+		} finally {
+			authStorage.keys.removeRuntime("openrouter");
+		}
 	});
 
 	it("pins the first scoped model and sets no deferred pattern when the scope resolved", async () => {
